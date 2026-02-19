@@ -17,12 +17,10 @@ const {
 } = process.env;
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 [System] Fixed Proximity Mode Online on Port ${PORT}`);
+    console.log(`🚀 [System] Proximity Random Split Online on Port ${PORT}`);
 });
 
-mongoose.connect(MONGO_URI)
-    .then(() => console.log("📦 [Database] Connected Successfully!"))
-    .catch(err => console.error("❌ [Database] Connection Failed!", err.message));
+mongoose.connect(MONGO_URI).catch(err => console.error("❌ DB Error:", err.message));
 
 const Player = mongoose.model('Player', new mongoose.Schema({ mcName: String, discordId: String }));
 
@@ -31,22 +29,41 @@ const client = new Client({
 });
 
 let liveData = {}; 
+let currentPartner = {}; // ใช้ติดตามว่าตอนนี้ใครคู่กับใครใน Discord
 
-// ฟังก์ชันหาห้องว่าง
-async function findEmptyChannel(guild) {
+// --- 1. ระบบล้างข้อมูลคนออกเกม (Cleanup) ทุกๆ 5 วินาที ---
+setInterval(() => {
+    const now = Date.now();
+    for (const name in liveData) {
+        if (now - liveData[name].lastUpdate > 5000) { // ถ้าหายไปเกิน 5 วินาที
+            console.log(`🗑️ [Cleanup] ลบพิกัดคนออฟไลน์: ${name}`);
+            delete liveData[name];
+        }
+    }
+}, 5000);
+
+// ฟังก์ชันสุ่มหาห้องว่าง (ที่ต้องไม่ใช่ห้องเดิม)
+async function findRandomEmptyChannel(guild, currentChannelId) {
     try {
         const category = await guild.channels.fetch(CATEGORY_ID);
-        return category.children.cache
-            .filter(c => c.type === ChannelType.GuildVoice && c.members.size === 0 && c.id !== LOBBY_ID)
-            .first();
+        const emptyRooms = category.children.cache
+            .filter(c => 
+                c.type === ChannelType.GuildVoice && 
+                c.members.size === 0 && 
+                c.id !== LOBBY_ID && 
+                c.id !== currentChannelId // ห้ามสุ่มได้ห้องเดิม
+            );
+        
+        if (emptyRooms.size === 0) return null;
+        return emptyRooms.random();
     } catch (e) { return null; }
 }
 
-// ระบบ Auto-Move จาก Lobby
+// เข้า Lobby แล้วดีดไปห้องสุ่ม
 client.on('voiceStateUpdate', async (oldState, newState) => {
     if (newState.channelId === LOBBY_ID && oldState.channelId !== LOBBY_ID) {
-        const emptyRoom = await findEmptyChannel(newState.guild);
-        if (emptyRoom) await newState.setChannel(emptyRoom);
+        const randomRoom = await findRandomEmptyChannel(newState.guild, null);
+        if (randomRoom) await newState.setChannel(randomRoom);
     }
 });
 
@@ -70,13 +87,12 @@ app.post('/sync', async (req, res) => {
     } catch (err) { res.sendStatus(500); }
 });
 
-// --- หัวใจการแก้ไขบัคสลับห้อง ---
 async function handleVoiceMove(moverName) {
     const mover = liveData[moverName];
     let partnerName = null;
     let shortestDist = DISTANCE_LIMIT;
 
-    // 1. หาคนที่อยู่ใกล้ที่สุด
+    // หาเพื่อนที่อยู่ใกล้ที่สุด
     for (let name in liveData) {
         if (name === moverName || !liveData[name].discordId) continue;
         const other = liveData[name];
@@ -93,38 +109,31 @@ async function handleVoiceMove(moverName) {
         if (!member.voice.channel) return;
 
         if (partnerName) {
-            // --- กรณีเจอคนใกล้ (MERGE) ---
-            // ใช้กฎ: คนที่ชื่อ "มาทีหลัง" ในลำดับตัวอักษร จะเป็นคนย้ายไปหาคนที่ชื่อ "มาก่อน"
-            // เช่น A กับ B -> B จะย้ายไปหา A เสมอ (ป้องกันการย้ายสวนกัน)
-            if (moverName.toLowerCase() > partnerName.toLowerCase()) {
-                const partner = liveData[partnerName];
-                const partnerMember = await guild.members.fetch(partner.discordId);
-                
-                if (partnerMember.voice.channelId && member.voice.channelId !== partnerMember.voice.channelId) {
-                    await member.voice.setChannel(partnerMember.voice.channelId);
-                    console.log(`🔗 [Merge] ${moverName} ย้ายไปหา ${partnerName}`);
+            // --- [กรณี: เจอเพื่อน] ---
+            if (currentPartner[moverName] !== partnerName) {
+                // ใช้กฎลำดับตัวอักษรเพื่อป้องกันการย้ายสวนกัน
+                if (moverName.toLowerCase() > partnerName.toLowerCase()) {
+                    const partner = liveData[partnerName];
+                    const partnerMember = await guild.members.fetch(partner.discordId);
+                    if (partnerMember.voice.channelId && member.voice.channelId !== partnerMember.voice.channelId) {
+                        await member.voice.setChannel(partnerMember.voice.channelId);
+                        currentPartner[moverName] = partnerName;
+                        console.log(`🔗 [Merge] ${moverName} ไปหา ${partnerName}`);
+                    }
+                } else {
+                    // เราเป็นคนยืนนิ่ง รอเพื่อนย้ายมาหา
+                    currentPartner[moverName] = partnerName;
                 }
             }
         } else {
-            // --- กรณีอยู่คนเดียว (SPLIT) ---
-            if (member.voice.channel.members.size > 1) {
-                // เช็คว่าคนอื่นในห้องอยู่ไกลหมดเลยใช่ไหม?
-                let anyoneNear = false;
-                member.voice.channel.members.forEach(m => {
-                    const otherName = Object.keys(liveData).find(k => liveData[k].discordId === m.id);
-                    if (otherName && otherName !== moverName) {
-                        const other = liveData[otherName];
-                        const d = Math.sqrt(Math.pow(mover.x-other.x,2)+Math.pow(mover.y-other.y,2)+Math.pow(mover.z-other.z,2));
-                        if (d < DISTANCE_LIMIT) anyoneNear = true;
-                    }
-                });
-
-                if (!anyoneNear) {
-                    const emptyRoom = await findEmptyChannel(guild);
-                    if (emptyRoom) {
-                        await member.voice.setChannel(emptyRoom);
-                        console.log(`🏃 [Split] ${moverName} แยกไปห้องว่าง`);
-                    }
+            // --- [กรณี: อยู่คนเดียว] ---
+            // ถ้าเดิมเคยมีคู่ (เพิ่งแยกกัน) หรือ ห้องปัจจุบันมีคนอื่นอยู่
+            if (currentPartner[moverName] !== null || member.voice.channel.members.size > 1) {
+                const randomRoom = await findRandomEmptyChannel(guild, member.voice.channelId);
+                if (randomRoom) {
+                    await member.voice.setChannel(randomRoom);
+                    currentPartner[moverName] = null; // รีเซ็ตสถานะเป็นโสด
+                    console.log(`🏃 [Split] ${moverName} แยกไปห้องสุ่มใหม่: ${randomRoom.name}`);
                 }
             }
         }
